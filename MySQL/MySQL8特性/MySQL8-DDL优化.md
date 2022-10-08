@@ -1,0 +1,211 @@
+# MySQL8 - DDL优化
+## Atomic DDL
+
+8.0之前的DDL
+
+![img](https://s2.loli.net/2021/12/08/smhoqpD69SERCFk.jpg)
+
+8.0中的DDL
+
+![img](https://s2.loli.net/2021/12/08/ncfI9QxjR3qZdOM.jpg)
+
+MySQL8开始支持Atomic DDL(原子DDL)，将数据字典更新，存储引擎，二进制日志都放到一个事务中去执行。对此主要做了以下改进：
+- 将数据字典表统一为InnoDB，对数据字典的操作也就是对InnoDB表进行DML操作，在DDL执行过程中会开启一个事务，当事务Commit了则DDL成功了，Commit之前DDL事务也可以回滚。
+- 对于涉及到数据文件操作的DDL，InnoDB将文件的操作指令写入DDL Log表中(mysql.innodb_ddl_log)，将DDL LOG表和数据字典的操作放到一个事务中以实现是事务的原子性。这类操作包含：CREATE TABLE/ALTER TABLE/DROP TABLE/RENAME TABLE/CREATE INDEX/DROP INDEX/DROP DATABASE
+  
+  | 操作指令     | 描述                                                      |
+  | ------------ | --------------------------------------------------------- |
+  | DELETE SPACE | 删除指定的table space文件                                 |
+  | DROP         | 从mysql.innodb_dynamic_metadata表中删除指定表的信息       |
+  | RENAME SPACE | 重命名指定表的table space文件                             |
+  | RENAME TABLE | 重命名指定表，包括修改metadata,以及统计信息中的表名等操作 |
+  | FREE         | 删除指定的索引                                            |
+  | REMOVE CACHE | 从table cache中移除指定的表                               |
+  
+  mysql.innodb_ddl_log为隐藏数据字典表，如果想看表的数据可以设置参数innodb_print_ddl_logs为1
+  
+  ```
+  mysql> SET GLOBAL innodb_print_ddl_logs=1;
+  mysql> CREATE TABLE t1 (c1 INT) ENGINE = InnoDB;
+  
+  [Note] [000000] InnoDB: DDL log insert : [DDL record: DELETE SPACE, id=18, thread_id=7,
+  space_id=5, old_file_path=./test/t1.ibd]
+  [Note] [000000] InnoDB: DDL log delete : by id 18
+  [Note] [000000] InnoDB: DDL log insert : [DDL record: REMOVE CACHE, id=19, thread_id=7,
+  table_id=1058, new_file_path=test/t1]
+  [Note] [000000] InnoDB: DDL log delete : by id 19
+  [Note] [000000] InnoDB: DDL log insert : [DDL record: FREE, id=20, thread_id=7,
+  space_id=5, index_id=132, page_no=4]
+  [Note] [000000] InnoDB: DDL log delete : by id 20
+  [Note] [000000] InnoDB: DDL log post ddl : begin for thread id : 7
+  [Note] [000000] InnoDB: DDL log post ddl : end for thread id : 7
+  ```
+- DDL的binlog event记录DDL的xid，通过xid来实现crash safe
+  
+  原子DDL执行步骤：
+  
+  1. 准备：创建所需的对象并将DDL⽇志写入 mysql.innodb_ddl_log表中。DDL日志定义了如何前滚和回滚DDL操作
+  2. 执行：执行DDL操作
+  3. 提交：更新数据字典并提交数据字典事务
+  4. POST DDL：为确保回滚可以安全执⾏⽽不引⼊不⼀致性，在此最后阶段执⾏⽂件操作（如重命名或删除数据文件）。这一阶段还从 mysql.innodb_dynamic_metadata的数据字典表删除的动态元数据为了DROP TABLE，TRUNCATE和其它重建表的DDL操作
+  
+  > ⽆论事务是提交还是回滚，DDL日志都会mysql.innodb_ddl_log在Post-DDL阶段重播并从表中删除 。mysql.innodb_ddl_log如果服务器在DDL操作期间暂停，DDL⽇志应该只保留在表中。在这种情况下，DDL⽇志会在恢复后重播并删除。
+  >
+  > 在恢复情况下，当服务器重新启动时，可能会提交或回退DDL事务。如果在重做⽇志和⼆进制日志中存在DDL操作的提交阶段期间执⾏的数据字典事务，则该操作被认为是成功的并且被前滚。否则，在InnoDB重放数据字典重做日志时回滚不完整的数据字典事务 ，并且回滚DDL事务
+  
+  在8.0之前，开启GTID后MySQL是不允许执行create table...select的语法的，因为CREATE和SELECT是两个不同的事务，没办法实现原子性。在8.0实现Atomic DDL后就可以执行该语句了，通过binlog日志可以看到在create table语句后加上了START TRANSACTION来开启一个原子事务
+  
+  ```
+  BEGIN                   // Query_log_eventCREATE TABLE ..... START TRANSACTION  // Query_log_event
+                        // Table_map_log_eventINSERT                  // Write_rows_log_event
+  COMMIT                  // Xid_log_event
+  ```
+## Instant快速加列
+
+在MySQL5.7中，Innodb通过重新生成表(即使采用INPLACE DDL算法)向表添加列，其会存在以下问题：
+- 对于大表，可能重建时间会很长
+- 由于过程中会产生临时表，会占用磁盘空间
+- DDL占用较多资源
+- 对于复制，将会造成较大的同步延迟
+  
+  详细内容可查看：[Online DDL](https://note.youdao.com/s/YCc9NRkj)
+### Instant概述
+
+在MySQL8.0.12开始引入新的算法：INSTANT，这将保证要么立即完成操作，要么根本不进行操作。如果未显示指定ALGORITHM，那么会优先选择INSTANT算法，如果不行再使用INPLACE算法，如果不支持INPLACE算法则使用COPY的方式完成
+```
+ALTER TABLE table_name [alter_specification], ALGORITHM=INSTANT;
+```
+INSTANT算法的好处是仅修改数据字典元数据，在SE更改期间无需获取元数据锁，并且不涉及表数据。在使用INSTANT算法时，无需指定LOCK选项，如果设置为DEFAULT以外的值，将会接收到错误
+```
+SQL> ALTER TABLE t1 ALTER COLUMN i SET DEFAULT 11, ALGORITHM=INSTANT, LOCK=NONE;
+ERROR HY000: Incorrect usage of ALGORITHM=INSTANT and LOCK=NONE/SHARED/EXCLUSIVE
+```
+如果为无法立即完成的任何操作设置了INSTANT算法，也将接收到错误
+```
+
+SQL> ALTER TABLE t1 ALTER COLUMN i SET DEFAULT 12, DROP COLUMN j, ALGORITHM=INSTANT;
+ERROR 0A000: ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=COPY/INPLACE.
+```
+目前，InnoDB支持INSTANT算法的操作如下：
+- 更改索引选项
+- 重命名表(ALTER)
+- 设置或删除default值
+- 修改列
+- 添加或删除虚拟列
+- 添加列(non-generated)
+  
+  ```
+  mysql> CREATE TABLE t1 (a INT, b INT, KEY(b));
+  Query OK, 0 rows affected (0.70 sec)
+  
+  mysql> # Modify the index can be instant if it's a trivial change
+  mysql> ALTER TABLE t1 DROP KEY b, ADD KEY b(b) USING BTREE, ALGORITHM = INSTANT; 
+  Query OK, 0 rows affected (0.14 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> # Rename the table through ALTER TABLE can be instant
+  mysql> ALTER TABLE t1 RENAME TO t2, ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.26 sec)
+  
+  mysql> # SET DEFAULT to a column can be instant
+  mysql> ALTER TABLE t2 ALTER COLUMN b SET DEFAULT 100, ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.09 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> # DROP DEFAULT to a column can be instant
+  mysql> ALTER TABLE t2 ALTER COLUMN b DROP DEFAULT, ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.08 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> # MODIFY COLUMN can be instant
+  mysql> ALTER TABLE t2 ADD COLUMN c ENUM('a', 'b', 'c'), ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.35 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> ALTER TABLE t2 MODIFY COLUMN c ENUM('a', 'b', 'c', 'd', 'e'), ALGORITHM=INSTANT;
+  Query OK, 0 rows affected (0.12 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> # ADD/DROP virtual column can be instant
+  mysql> ALTER TABLE t2 ADD COLUMN (d INT GENERATED ALWAYS AS (a + 1) VIRTUAL), ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.38 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> ALTER TABLE t2 DROP COLUMN d, ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.40 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> # Do two operations instantly in the same statement
+  mysql> ALTER TABLE t2 ALTER COLUMN a SET DEFAULT 20, ALTER COLUMN b SET DEFAULT 200, ALGORITHM = INSTANT;
+  Query OK, 0 rows affected (0.20 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> DROP TABLE t2;
+  Query OK, 0 rows affected (0.36 sec)
+  ```
+  
+  我们在使用INSTANT快速添加列之后，可以通过information_schema下的视图来观察表和列的信息
+  ```
+  mysql> CREATE TABLE t1 (a INT, b INT);
+  Query OK, 0 rows affected (0.06 sec)
+  
+  mysql> SELECT table_id, name, instant_cols FROM information_schema.innodb_tables WHERE name LIKE '%t1%';
+  +----------+---------+--------------+
+  | table_id | name    | instant_cols |
+  +----------+---------+--------------+
+  |     1065 | test/t1 |            0 |
+  +----------+---------+--------------+
+  1 row in set (0.22 sec)
+  
+  mysql> SELECT table_id, name, has_default, default_value FROM information_schema.innodb_columns WHERE table_id = 1065;
+  +----------+------+-------------+---------------+
+  | table_id | name | has_default | default_value |
+  +----------+------+-------------+---------------+
+  |     1065 | a    |           0 | NULL          |
+  |     1065 | b    |           0 | NULL          |
+  +----------+------+-------------+---------------+
+  2 rows in set (0.38 sec)
+  
+  mysql> ALTER TABLE t1 ADD COLUMN c INT, ADD COLUMN d INT DEFAULT 1000, ALGORITHM=INSTANT;
+  Query OK, 0 rows affected (0.07 sec)
+  Records: 0  Duplicates: 0  Warnings: 0
+  
+  mysql> SELECT table_id, name, instant_cols FROM information_schema.innodb_tables WHERE name LIKE '%t1%';
+  +----------+---------+--------------+
+  | table_id | name    | instant_cols |
+  +----------+---------+--------------+
+  |     1065 | test/t1 |            2 |
+  +----------+---------+--------------+
+  1 row in set (0.03 sec)
+  
+  mysql> SELECT table_id, name, has_default, default_value FROM information_schema.innodb_columns WHERE table_id = 1065;
+  +----------+------+-------------+---------------+
+  | table_id | name | has_default | default_value |
+  +----------+------+-------------+---------------+
+  |     1065 | a    |           0 | NULL          |
+  |     1065 | b    |           0 | NULL          |
+  |     1065 | c    |           1 | NULL          |
+  |     1065 | d    |           1 | 800003e8      |
+  +----------+------+-------------+---------------+
+  4 rows in set (0.36 sec)
+  ```
+  
+  我们可以注意到TABLE_ID并未发生修改，因此并没有重建表。instant_cols表示表中存在2个通过INSTANT添加的列，has_default等于1表示INSTANT ADD，其默认值记录在default_value中
+### 工作原理
+
+InnoDB主要有两种行格式，redundant和compact格式。dynamic格式是compact的一个小变种。compact及其派生的行格式从redundant行格式中删除了一些元数据，以节省空间。由于这种"节省空间"的变化，当我们必须对页面上的物理行中的数据进行反序列化时，我们总是需要从内部的元数据结构中查找元数据。为了实现INSTANT ADD，我们需要针对dynamic和compact行格式添加一些元数据到page上的物理记录。redundant则不需要，因为列的数量已经保存在物理记录中。
+
+额外的信息与数据字典中的一些元数据一起保存在物理记录中，其中包含一个存储在info_bits中的标志。info_bits中的信息用于跟踪记录是否在第一个即时添加列之后创建，并且也用于跟踪物理记录中的列数。当表经历第一个INSTANT ADD COULMN时的列数以及新添加的列的所有默认值都存储在数据字典中，这两条信息保存在数据字典表的SE_PRIVATE_DATA列中
+
+如果表上从未发生过instant add column, 则行格式维持不变；如果发生过instant ddl, 那么所有新的记录上都被特殊标记了一个instant标志位, 同时在行头存储了列的个数。由于只支持往后顺序加列，通过列的个数就可以知道这个行记录中包含了哪些列的信息
+### 限制
+- 仅支持在一个语句中添加列，也就是说，如果同一语句中还有其他非即时操作，则无法立即完成
+- 只支持向后添加列，而不是现有列的中间
+- 不支持COMPRESSED格式
+- 不支持已经有任何全文索引的表
+- 不支持驻留在DD表空间中的任何表
+- 不支持临时表
+- 当发生与INSTANT不兼容的DDL时，表数据就会进行重建
+### 参考链接
+
+1、[MySQL 8.0: InnoDB now supports Instant ADD COLUMN](https://mysqlserverteam.com/mysql-8-0-innodb-now-supports-instant-add-column/)

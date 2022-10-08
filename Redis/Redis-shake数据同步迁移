@@ -1,0 +1,112 @@
+---
+title: Redis-shake数据同步迁移
+date: 2021-10-15 15:30:30
+updated: 2021-10-15 15:30:30
+tags: redis
+categories: redis
+keywords: redis-shake
+description: 
+top_img: 
+comments: 
+cover: https://help-static-aliyun-doc.aliyuncs.com/assets/img/zh-CN/3695728061/p202961.png
+toc: true
+toc_number: 
+copyright: 
+copyright_author: luhengxing
+copyright_author_href: 
+copyright_url: 
+copyright_info: 
+mathjax: 
+katex: 
+aplayer: 
+highlight_shrink: 
+aside: true
+---
+[TOC]
+
+# Redis-shake数据同步迁移
+
+Redis-shake是阿里云开源的redis数据传输工具，支持对redis数据进行解析(decode)，恢复(restore)，备份(dump)和同步(rump/sync)，部署简单高效。同步模式支持全量同步以及增量同步，能够满足多种场景需求
+
+## 注意事项
+
+1. redis版本为2.8，3.0，3.2，4.0，5.0版本
+2. 跨版本同步或恢复需进行兼容性验证
+3. target库的maxmemory-policy如果配置为noeviction以外的值，可能导致数据差异
+4. source库的key设置了过期时间，key可能已过期而未被删除，target看到的key可能会比source少
+
+
+
+## redis-shake安装
+
+redis-shake使用go语言开发，因此需要先安装go环境
+
+```
+$ yum install golang
+```
+
+下载redis-shake
+
+```
+$ wget 'https://github.com/alibaba/RedisShake/archive/refs/tags/release-v2.1.1-20210903.tar.gz'
+```
+
+解压安装包
+
+```
+$ tar xzf release-v2.1.1-20210903.tar.gz
+```
+
+修改配置文件
+
+```
+$ cd RedisShake-release-v2.1.1-20210903 && vim redis-shake.conf
+```
+
+核心配置
+
+| 参数                 | 描述                                                         | 示例值                     |
+| -------------------- | ------------------------------------------------------------ | -------------------------- |
+| log.file             | 日志文件路径，不制定则输出到stdout                           | /data/logs/redis-shake.log |
+| source.type          | 指定源库的架构，支持standalone，sentinel，cluster和proxy四种模式 | standalone                 |
+| source.address       | 指定源库的链接，包括连接地址和端口号                         | 127.0.0.1:6379             |
+| source.password_raw  | 指定源库的认证密码                                           | 123456                     |
+| target.type          | 指定目标库的架构，支持standalone，sentinel，cluster和proxy四种模式 | standalone                 |
+| target.password_raw  | 指定目标库的认证密码                                         | 123456                     |
+| target.db            | 目标库存放数据的数据库number                                 | 1                          |
+| target.dbmap         | 源库与目标库的映射关系，与target.db冲突                      | 1-2                        |
+| key_exists           | 目标存在相同key时的处理策略，支持rewrite(覆盖)，none(退出)，ingore(忽略，rump模式不生效) | rewrite                    |
+| filter.db.whitelist  | 数据库白名单，指定那些数据库能通过。与之相反的就是filter.db.blacklist | 1;2;3                      |
+| filter.key.whitelist | key白名单，指定哪些key能够通过，也支持指定前缀。与之相反的就是filter.key.blacklist | key-xxx-                   |
+| filter.slot          | cluster架构支持指定迁移的slot                                | 100                        |
+| scan.key_number      | rump模式采用scan方式扫描Key，参数指定每次扫描的数量          | 100                        |
+| parallel             | Redis-shake执行迁移的并发线程数，适当调大该值可提高同步性能  | 4                          |
+
+
+
+## 执行迁移
+
+**sync(同步)模式**
+
+```shell
+$ ./redis-shake.linux -type=sync -conf=redis-shake.conf &
+```
+
+**rump模式**
+
+有的云托管Redis不支持sync模式采用的psync，例如AWS。因此只能采用rump模式进行迁移，该模式不支持增量同步，因此在正式迁移前需停止源库写入，否则数据将可能不一致。
+
+```shell
+$ ./redis-shake.linux -type=rump -conf=redis-shake.conf 
+```
+
+**RDB Restore**
+
+>  需要先修改参数source.rdb.input，设置RDB备份文件路径
+
+```shell
+$ ./redis-shake.linux -type=restore -conf=redis-shake.conf
+```
+
+
+
